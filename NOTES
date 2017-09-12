@@ -1,0 +1,12 @@
+Audio Header Files
+
+AudioUnitProperties
+    Lists different Apple supplied AudioUnits
+
+AudioComponent
+    Methods for finding and opening AudioUnits and other components
+
+AUComponent
+    Set properties of AudioUnit instance
+
+
