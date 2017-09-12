@@ -17,6 +17,7 @@ static char strbuf[STRBUFSIZE];
     } while (0)
 
 static volatile int done = 0;
+static volatile int rendering = 0;
 
 static AudioUnit au, au_output;
 
@@ -30,7 +31,9 @@ void
 afr_completion_proc(void *aux, ScheduledAudioFileRegion *afr, OSStatus result)
 {
     fprintf(stderr, "Region completed, status %d\n", result);
-    //    done = 1;
+    if (rendering) {
+        done = 1;
+    }
 }
 
 static OSStatus
@@ -78,7 +81,7 @@ renderCallback(void *                      inRefCon,
 }
 
 static void
-make_AudioFilePlayer(AudioUnit *_au)
+make_AudioFilePlayer(AudioUnit *_au, int nChans, AudioStreamBasicDescription *asbd)
 {
     AudioComponentDescription ac_desc = {
         .componentType = kAudioUnitType_Generator,
@@ -102,6 +105,25 @@ make_AudioFilePlayer(AudioUnit *_au)
     OSStatus oss;
     CHK_ERR(
       oss = AudioComponentInstanceNew(ac, _au), "%d getting instance", oss);
+    /* The stream format must be sent before intializing. */
+    UInt32                      asbd_sz = sizeof(AudioStreamBasicDescription);
+    CHK_ERR(oss = AudioUnitGetProperty(au,
+                                       kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output,
+                                       0,
+                                       asbd,
+                                       &asbd_sz),
+            "%d getting stream format",
+            oss);
+    asbd->mChannelsPerFrame = nChans;
+    CHK_ERR(oss = AudioUnitSetProperty(au,
+                                       kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output,
+                                       0,
+                                       asbd,
+                                       sizeof(AudioStreamBasicDescription)),
+            "%d setting stream format",
+            oss);
     CHK_ERR(oss = AudioUnitInitialize(*_au), "%d intializing audio unit", oss);
 }
 
@@ -148,45 +170,13 @@ int
 main(void)
 {
     int realtime = 0;
-    make_AudioFilePlayer(&au);
-    OSStatus oss;
-    /* TODO: Make Mono output.
-       So far I haven't been able to set this to anything other than the format
-       it returns.
-       To get the format, you have to set size of return type on call (e.g.,
-       asbd_sz), and it will contain the size of the returned data after the
-       call. */
-    // AudioStreamBasicDescription asbd = {
-    //    .mSampleRate = 44100,
-    //    .mFormatID = 'lpcm',
-    //    .mFormatFlags = 0x29,
-    //    .mBytesPerPacket = 9,
-    //    .mFramesPerPacket = 1,
-    //    .mBytesPerFrame = 8,
-    //    .mChannelsPerFrame = 2,
-    //    .mBitsPerChannel = 32,
-    //    .mReserved = 0
-    //};
     AudioStreamBasicDescription asbd;
-    UInt32                      asbd_sz = sizeof(AudioStreamBasicDescription);
-    CHK_ERR(oss = AudioUnitGetProperty(au,
-                                       kAudioUnitProperty_StreamFormat,
-                                       kAudioUnitScope_Output,
-                                       0,
-                                       &asbd,
-                                       &asbd_sz),
-            "%d getting stream format",
-            oss);
-    // asbd.mChannelsPerFrame = 1;
-    // asbd.mBytesPerFrame = asbd.mBitsPerChannel / 8 * asbd.mChannelsPerFrame;
-    CHK_ERR(oss = AudioUnitSetProperty(au,
-                                       kAudioUnitProperty_StreamFormat,
-                                       kAudioUnitScope_Output,
-                                       0,
-                                       &asbd,
-                                       sizeof(AudioStreamBasicDescription)),
-            "%d setting stream format",
-            oss);
+    if (realtime) {
+        make_AudioFilePlayer(&au,2,&asbd);
+    } else {
+        make_AudioFilePlayer(&au,1,&asbd);
+    }
+    OSStatus oss;
     CFURLRef af_url =
       CFURLCreateWithString(NULL, CFSTR("/tmp/example.aif"), NULL);
     AudioFileID af_id;
@@ -232,6 +222,7 @@ main(void)
             "%d priming audio regions",
             oss);
     /* This seems to start playback, too. */
+    rendering = 1;
     CHK_ERR(oss =
               AudioUnitSetProperty(au,
                                    kAudioUnitProperty_ScheduleStartTimeStamp,
@@ -249,9 +240,9 @@ main(void)
             ;
     } else {
         char abl_dat[sizeof(AudioBufferList) + 2 * sizeof(AudioBuffer)];
-
         AudioBufferList *abl = (AudioBufferList *)abl_dat;
-        abl->mNumberBuffers = 2;
+        /* Read mono from player */
+        abl->mNumberBuffers = 1;
         float abuffer[2 * AUDIO_BUF_LEN];
         abl->mBuffers[0] = (AudioBuffer){
             .mNumberChannels = 1,
@@ -267,23 +258,90 @@ main(void)
         AudioTimeStamp             ats_rt = { .mSampleTime = 0,
                                   .mFlags = kAudioTimeStampSampleTimeValid };
 
+        CFURLRef af_out_url =
+            CFURLCreateWithString(NULL, CFSTR("/tmp/example_out.aif"), NULL);
+        ExtAudioFileRef afile_out;
+        AudioStreamBasicDescription afile_out_desc = 
+        {
+            .mSampleRate = 8000,
+            .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kAudioFormatFlagIsBigEndian|kAudioFormatFlagIsSignedInteger|kAudioFormatFlagIsPacked,
+            .mBytesPerPacket = 2,
+            .mFramesPerPacket = 1,
+            .mBytesPerFrame = 2,
+            .mChannelsPerFrame = 1,
+            .mBitsPerChannel = 16,
+        };
+        //{
+        //    .mSampleRate = 44100.,
+        //    .mFormatID = kAudioFormatLinearPCM,
+        //    .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        //    .mBytesPerPacket = 4,
+        //    .mFramesPerPacket = 1,
+        //    .mBytesPerFrame = 4,
+        //    .mChannelsPerFrame = 2,
+        //    .mBitsPerChannel = 16,
+        //};
+        CHK_ERR(oss = 
+            ExtAudioFileCreateWithURL(af_out_url,
+                    kAudioFileAIFFType,
+                    &afile_out_desc,
+                    NULL,
+                    kAudioFileFlags_EraseFile,
+                    &afile_out),
+            "%d creating output file",
+            oss);
+        CHK_ERR(oss = 
+                ExtAudioFileSetProperty(	afile_out,
+                    kExtAudioFileProperty_ClientDataFormat,
+                    sizeof(AudioStreamBasicDescription),
+                    &asbd),
+                "%d setting output file client format",
+                oss);
+
+        //AudioChannelLayout af_out_client_layout = {
+        //    .mChannelLayoutTag = kAudioChannelLayoutTag_Mono,
+        //    .mChannelBitmap = 0,
+        //    .mNumberChannelDescriptions = 0
+        //};
+
+        //CHK_ERR(oss = 
+        //        ExtAudioFileSetProperty(	afile_out,
+        //            kExtAudioFileProperty_ClientChannelLayout,
+        //            sizeof(AudioChannelLayout),
+        //            &af_out_client_layout),
+        //        "%d setting output file client layout",
+        //        oss);
+
         while (!done) {
             CHK_ERR(oss = AudioUnitRender(
                       au, &ra_flags, &ats_rt, 0, AUDIO_BUF_LEN, abl),
                     "%d rendering",
                     oss);
-            size_t n;
-            for (n = 0; n < AUDIO_BUF_PRINT_LEN; n++) {
-                printf("%f\n", ((float *)abl->mBuffers[0].mData)[n]);
-            }
-            printf("\n");
-            for (n = 0; n < AUDIO_BUF_PRINT_LEN; n++) {
-                printf("%f\n", ((float *)abl->mBuffers[1].mData)[n]);
-            }
-            printf("\n");
+//            size_t n;
+            /* Acutally only first buffer is used. */
+            //for (n = 0; n < AUDIO_BUF_PRINT_LEN; n++) {
+            //    printf("%f\n", ((float *)abl->mBuffers[0].mData)[n]);
+            //}
+            //printf("\n");
+            //for (n = 0; n < AUDIO_BUF_PRINT_LEN; n++) {
+            //    printf("%f\n", ((float *)abl->mBuffers[1].mData)[n]);
+            //}
+            //printf("\n");
+            CHK_ERR(oss = ExtAudioFileWrite(afile_out,
+                    AUDIO_BUF_LEN,
+                    abl),
+                    "%d writing to out file",
+                    oss);
             ats_rt.mSampleTime += AUDIO_BUF_LEN;
-            sleep(1);
+//            sleep(1);
+//        done = 1;
         }
+        rendering = 0;
+        CHK_ERR(oss = ExtAudioFileDispose(afile_out),
+                "%d closing out file",
+                oss);
+        
     }
     AudioOutputUnitStop(au_output);
     AudioFileClose(af_id);
